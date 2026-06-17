@@ -161,6 +161,8 @@ class SpecificModelRunner:
                 if now - last_time > self.MODEL_TTL_SECONDS
             ]
             for label in to_remove:
+                if label in self.sessions and getattr(self.sessions[label], '_in_use', False):
+                    continue
                 app_logger.info(f"TTL Cleanup: Unloading '{label}' (idle {self.MODEL_TTL_SECONDS}s)")
                 self.sessions.pop(label, None)
                 self.tokenizers.pop(label, None)
@@ -299,7 +301,8 @@ class SpecificModelRunner:
         model_dir = self._safe_model_dir(label, model_path)
 
         # OPT-1: mark stats dirty; actual disk write happens in background
-        self.stats[label] = self.stats.get(label, 0) + 1
+        with self._cleanup_lock:
+            self.stats[label] = self.stats.get(label, 0) + 1
         self._stats_dirty = True
 
         # Apply task prefix if needed

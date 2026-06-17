@@ -1,8 +1,20 @@
 import logging
+import logging.handlers
 import os
+import re
 
 # Create logs directory if it doesn't exist
 os.makedirs('logs', exist_ok=True)
+
+_INJECT_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+class SafeFormatter(logging.Formatter):
+    """Formatter that strips control characters to prevent log injection."""
+
+    def format(self, record):
+        msg = super().format(record)
+        return _INJECT_CHARS.sub('', msg)
+
 
 class ColorFormatter(logging.Formatter):
     COLOR_MAP = {
@@ -25,8 +37,12 @@ class ColorFormatter(logging.Formatter):
 
 def setup_logger(name, log_file, level=logging.INFO):
     """Configures a logger with file and console outputs."""
-    handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    handler = logging.handlers.RotatingFileHandler(
+        log_file, mode='a', encoding='utf-8',
+        maxBytes=10 * 1024 * 1024,  # 10 MB
+        backupCount=5
+    )
+    handler.setFormatter(SafeFormatter('%(asctime)s - %(levelname)s - %(message)s'))
 
     console = logging.StreamHandler()
     console.setFormatter(ColorFormatter('%(levelname)s: %(message)s'))

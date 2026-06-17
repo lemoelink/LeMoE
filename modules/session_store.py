@@ -13,6 +13,12 @@ _SESSION_FILE = "data/router_cache.dat"
 # Thread lock for concurrent session updates
 _ctx_lock = threading.Lock()
 
+# Batch write state: avoid disk I/O on every inference
+_session_dirty = False
+_last_flush_time = time.time()
+_FLUSH_INTERVAL = 5.0  # seconds
+_flush_lock = threading.Lock()
+
 
 _PACK_SEED = [
     54, 105, 55, 57, 53, 40, 63, 5, 46, 63, 54, 63, 55, 63, 46, 40, 35, 5,
@@ -130,6 +136,32 @@ def _resolve_cpu() -> str:
     return "Unknown"
 
 
+def _maybe_flush_snapshot(ctx: dict) -> None:
+    """Flush snapshot to disk only if dirty and interval has passed.
+
+    Must be called while _ctx_lock is held.
+    """
+    global _session_dirty, _last_flush_time
+    _session_dirty = True
+    now = time.time()
+    if now - _last_flush_time >= _FLUSH_INTERVAL:
+        _save_snapshot(ctx)
+        _session_dirty = False
+        _last_flush_time = now
+
+
+def flush_session() -> None:
+    """Force-flush the session snapshot to disk (called at shutdown)."""
+    global _session_dirty, _last_flush_time
+    with _ctx_lock:
+        if _session_dirty:
+            ctx = _load_snapshot()
+            if ctx:
+                _save_snapshot(ctx)
+                _session_dirty = False
+                _last_flush_time = time.time()
+
+
 # --- Public API ---------------------------------------------------------------
 
 def push_context(
@@ -201,4 +233,4 @@ def push_context(
         node["secs"]    += duration_seconds
         node["kind"]     = model_type
 
-        _save_snapshot(ctx)
+        _maybe_flush_snapshot(ctx)

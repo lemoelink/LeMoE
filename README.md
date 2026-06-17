@@ -434,6 +434,8 @@ curl http://localhost:11435/health
 | GET | `/v1/models` | List models (OpenAI format) |
 | POST | `/v1/chat/completions` | Inference (OpenAI format, streaming supported) |
 | GET/POST | `/v1/route` | **Routing diagnostic** — scores a text against all experts without generating a response |
+| GET | `/v1/discover` | Discovers available Ollama models not yet configured as experts |
+| GET | `/v1/health/experts` | Health status of each individual expert |
 | GET | `/api/tags` | List models (Ollama format) |
 | POST | `/api/chat` | Inference (Ollama format, streaming supported) |
 | GET | `/api/version` | Server version |

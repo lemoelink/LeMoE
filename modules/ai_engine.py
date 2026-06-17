@@ -56,22 +56,23 @@ class AIEngine:
     def _ttl_cleanup_loop(self):
         while not self._stop_cleanup:
             time.sleep(60)
-            if self.llm and self.last_access > 0 and (time.time() - self.last_access) > self.ttl_seconds:
-                with self._cleanup_lock:
-                    if self.llm and (time.time() - self.last_access) > self.ttl_seconds:
-                        app_logger.info(
-                            f"AIEngine TTL Cleanup: Unloading inactive model (idle {self.ttl_seconds}s)"
-                        )
-                        self.llm = None
-                        self.is_ready = False
-                        gc.collect()
+            with self._cleanup_lock:
+                if self.llm and self.last_access > 0 and (time.time() - self.last_access) > self.ttl_seconds:
+                    app_logger.info(
+                        f"AIEngine TTL Cleanup: Unloading inactive model (idle {self.ttl_seconds}s)"
+                    )
+                    self.llm = None
+                    self.is_ready = False
+                    gc.collect()
 
     def _ensure_model_loaded(self):
-        self.last_access = time.time()
         if LLAMA_AVAILABLE:
             with self._cleanup_lock:
+                self.last_access = time.time()
                 if not self.llm:
                     self.load_model()
+        else:
+            self.last_access = time.time()
 
     def load_model(self):
         if not os.path.exists(self.model_path):

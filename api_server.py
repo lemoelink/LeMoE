@@ -20,6 +20,7 @@ import time
 import uuid
 import threading
 from collections import defaultdict
+from collections import deque
 
 # Ensure cwd is always the script directory
 # (necessary for relative model paths to resolve correctly)
@@ -37,10 +38,55 @@ from modules.expert_runner import ExpertDispatcher
 from modules.plugin_manager import PluginManager
 
 # ---------------------------------------------------------------------------
+# Rate Limiter (sliding window per IP)
+# ---------------------------------------------------------------------------
+
+class _RateLimiter:
+    """Simple sliding-window rate limiter per IP address."""
+
+    def __init__(self, max_requests: int = 60, window_seconds: int = 60):
+        self._max_requests = max_requests
+        self._window = window_seconds
+        self._requests: dict[str, deque] = {}
+        self._lock = threading.Lock()
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 300  # seconds
+
+    def _cleanup_stale(self):
+        """Remove IPs with no recent activity to prevent unbounded memory growth."""
+        now = time.time()
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+        self._last_cleanup = now
+        stale_ips = [
+            ip for ip, timestamps in self._requests.items()
+            if not timestamps or timestamps[-1] < now - self._window * 2
+        ]
+        for ip in stale_ips:
+            del self._requests[ip]
+
+    def is_allowed(self, client_ip: str) -> bool:
+        now = time.time()
+        with self._lock:
+            self._cleanup_stale()
+            if client_ip not in self._requests:
+                self._requests[client_ip] = deque()
+            timestamps = self._requests[client_ip]
+            while timestamps and timestamps[0] < now - self._window:
+                timestamps.popleft()
+            if len(timestamps) >= self._max_requests:
+                return False
+            timestamps.append(now)
+            return True
+
+_rate_limiter = _RateLimiter()
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.4.0"
 DEFAULT_MODEL  = "l3mcore"
 
 
@@ -60,14 +106,39 @@ def _load_available_models(config_manager) -> list:
         if os.path.exists(cats_file):
             with open(cats_file, encoding='utf-8') as f:
                 data = _json.load(f)
-                experts = data.get('experts', [])
-                for entry in experts:
+            from modules.config_manager import deobfuscate_value
+            data = deobfuscate_value(data)
+            experts = data.get('experts', [])
+            for entry in experts:
                     label = entry.get('label', '').strip()
                     if label:
                         models.append(label)
         return models
     else:
         return [DEFAULT_MODEL, "malbec", "syrah", "pinot", "chardonnay", "grape-route"]
+
+
+def _validate_api_keys(config_manager) -> None:
+    """Logs warnings for API-type experts missing their configured API keys."""
+    try:
+        cats_file = config_manager.get('router', {}).get('categories_file', 'config/experts.json')
+        if not os.path.exists(cats_file):
+            return
+        with open(cats_file, encoding='utf-8') as f:
+            data = json.load(f)
+        from modules.config_manager import deobfuscate_value
+        data = deobfuscate_value(data)
+        for expert in data.get('experts', []):
+            if expert.get('type', '').lower() == 'api':
+                env_var = expert.get('api_key_env', '')
+                if env_var and not os.environ.get(env_var):
+                    label = expert.get('label', 'unknown')
+                    app_logger.warning(
+                        f"API expert '{label}': environment variable '{env_var}' is not set. "
+                        f"Inference will fail until the key is configured."
+                    )
+    except Exception as e:
+        app_logger.debug(f"_validate_api_keys: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +192,8 @@ class _Core:
         ai_engine = AIEngine(config_manager=config)
         dispatcher = ExpertDispatcher(runner, ai_engine, config_manager=config)
         plugin_mgr = PluginManager()
+
+        _validate_api_keys(config)
 
         available = _load_available_models(config)
         expert_models = [m for m in available if m != DEFAULT_MODEL]
@@ -461,6 +534,7 @@ def _run_inference_impl(messages: list, model_hint: str) -> tuple[str, str]:
 
                         app_logger.info(f"[ToolCalling] Ejecutando tool '{tool_name}' con args: {arguments}")
                         tool_result = plugin_mgr.hook_execute_tool(tool_name, arguments)
+                        app_logger.info(f"[ToolCalling] Tool '{tool_name}' resultado: {str(tool_result)[:200]}")
 
                         tc_msgs.append({
                             "role": "tool",
@@ -556,12 +630,36 @@ def set_security_headers(response):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-RateLimit-Limit"] = str(_rate_limiter._max_requests)
+    response.headers["X-RateLimit-Window"] = str(_rate_limiter._window)
+
+    try:
+        core = _Core.get()
+        cors_cfg = core["config"].get("cors", {})
+        if cors_cfg.get("enabled", False):
+            origin = cors_cfg.get("origin", "*")
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            response.headers["Access-Control-Max-Age"] = "86400"
+    except Exception:
+        pass
+
     return response
 
 
 
 @app.before_request
 def call_plugin_before_request():
+    client_ip = request.remote_addr or "unknown"
+    if not _rate_limiter.is_allowed(client_ip):
+        return jsonify({
+            "error": {
+                "message": "Rate limit exceeded. Please slow down.",
+                "type": "rate_limit_error"
+            }
+        }), 429
+
     core = _Core.get()
     if core and "plugin_mgr" in core:
         return core["plugin_mgr"].hook_before_request(request)
@@ -617,9 +715,9 @@ def _openai_chat_response(content: str, model: str) -> dict:
             "finish_reason": "stop",
         }],
         "usage": {
-            "prompt_tokens": -1,
-            "completion_tokens": -1,
-            "total_tokens": -1,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
         },
     }
 
@@ -637,6 +735,12 @@ def list_models_openai():
 
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
+    content_type = request.content_type or ""
+    if "application/json" not in content_type and "multipart/form-data" not in content_type:
+        return jsonify({
+            "error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}
+        }), 415
+
     body = request.get_json(force=True, silent=True) or {}
     messages    = body.get("messages") or []
     model_hint  = body.get("model", DEFAULT_MODEL)
@@ -717,6 +821,10 @@ def ollama_chat():
     Ollama POST /api/chat
     Body: { model, messages: [{role, content}], stream }
     """
+    content_type = request.content_type or ""
+    if "application/json" not in content_type:
+        return jsonify({"error": "Content-Type must be application/json"}), 415
+
     body = request.get_json(force=True, silent=True) or {}
     messages   = body.get("messages") or []
     model_hint = body.get("model", DEFAULT_MODEL)
@@ -916,6 +1024,29 @@ def discover_ollama():
     if not raw_url.startswith(("http://", "https://")):
         return jsonify({"error": {"message": "url must start with http:// or https://", "type": "invalid_request_error"}}), 400
 
+    # SSRF protection: validate URL is not targeting internal/private networks
+    try:
+        from urllib.parse import urlparse as _urlparse
+        parsed = _urlparse(raw_url)
+        import ipaddress as _ipaddress
+        import socket
+        hostname = parsed.hostname or ""
+        # Block cloud metadata and link-local
+        try:
+            resolved = socket.getaddrinfo(hostname, None)
+            for family, _, _, _, sockaddr in resolved:
+                addr = _ipaddress.ip_address(sockaddr[0])
+                if any(addr in net for net in [
+                    _ipaddress.ip_network("169.254.0.0/16"),
+                    _ipaddress.ip_network("100.64.0.0/10"),
+                    _ipaddress.ip_network("fd00::/8"),
+                ]):
+                    return jsonify({"error": {"message": "URL targets a blocked internal network", "type": "invalid_request_error"}}), 400
+        except (socket.gaierror, ValueError):
+            pass
+    except Exception:
+        pass
+
     core            = _Core.get()
     configured      = set(core["expert_models"])
     suggestions     = []
@@ -979,11 +1110,19 @@ def root():
 def health():
     """Returns the operational status of every core component."""
     core = _Core.get()
+    config = core["config"]
+
+    health_cfg = config.get("health", {})
+    if health_cfg.get("auth_required", False):
+        auth_header = request.headers.get("Authorization", "")
+        expected_token = health_cfg.get("auth_token", "")
+        if expected_token and auth_header != f"Bearer {expected_token}":
+            return jsonify({"error": {"message": "Unauthorized", "type": "auth_error"}}), 401
+
     router = core["router"]
     runner = core["runner"]
     ai_engine = core["ai_engine"]
     plugin_mgr = core["plugin_mgr"]
-    config = core["config"]
 
     router_status = "ok"
     router_mode = getattr(router, 'router_type', 'model')
@@ -1040,6 +1179,8 @@ def health_experts():
     try:
         with open(router_cfg_file, encoding="utf-8") as f:
             data = json.load(f)
+        from modules.config_manager import deobfuscate_value
+        data = deobfuscate_value(data)
         experts_list = data.get("experts", [])
     except Exception as e:
         return jsonify({"status": "error", "message": f"Could not read experts file: {e}"}), 500
@@ -1163,12 +1304,39 @@ def _start_experts_watcher():
     app_logger.info("Watcher: Started background thread for configuration and experts monitoring.")
 
 
+def _print_startup_summary(core: dict) -> None:
+    """Prints a summary of the loaded configuration at startup."""
+    config = core["config"]
+    router = core["router"]
+    plugin_mgr = core["plugin_mgr"]
+    available = core["available_models"]
+
+    router_cfg = config.get('router', {})
+    rl_cfg = config.get('rate_limiting', {})
+
+    app_logger.info("=" * 50)
+    app_logger.info("l3mcore - Startup Summary")
+    app_logger.info("=" * 50)
+    app_logger.info(f"  Router mode:     {router_cfg.get('mode', 'generic')}")
+    app_logger.info(f"  Router type:     {router_cfg.get('router_type', 'embedding')}")
+    app_logger.info(f"  Confidence:      {router_cfg.get('confidence_threshold', 0.4)}")
+    app_logger.info(f"  Experts loaded:  {len(available) - 1}")
+    app_logger.info(f"  Models:          {', '.join(available)}")
+    plugins = [getattr(p, '__name__', '?').replace('l3mcore_plugin.', '') for p in getattr(plugin_mgr, '_plugins', [])]
+    app_logger.info(f"  Plugins:         {len(plugins)} ({', '.join(plugins) if plugins else 'none'})")
+    tools = [getattr(t, '__name__', '?').replace('l3mcore_tool.', '') for t in getattr(plugin_mgr, '_tools', [])]
+    app_logger.info(f"  Tools:           {len(tools)} ({', '.join(tools) if tools else 'none'})")
+    rl_status = "enabled" if rl_cfg.get('enabled', True) else "disabled"
+    app_logger.info(f"  Rate limiting:   {rl_status} ({rl_cfg.get('max_requests', 60)}/{rl_cfg.get('window_seconds', 60)}s)")
+    app_logger.info("=" * 50)
+
+
 def _bootstrap():
     """Pre-load core + plugins once before the first request."""
     core = _Core.get()
-    PluginManager()
     _start_experts_watcher()
     core["plugin_mgr"].hook_on_startup(core)
+    _print_startup_summary(core)
 
 
 # Gunicorn calls this module-level; bootstrap when the module is imported

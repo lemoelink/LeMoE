@@ -3,6 +3,7 @@ import gc
 import json
 import time
 import ipaddress
+import threading
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse
@@ -159,6 +160,7 @@ class ExpertDispatcher:
         self.onnx_runner = onnx_runner
         self.ai_engine = ai_engine
         self._config_manager = config_manager
+        self._gguf_lock = threading.Lock()
 
     def _runner_cfg(self) -> dict:
         return _get_runner_config(self._config_manager)
@@ -355,6 +357,11 @@ class ExpertDispatcher:
         if tools:
             data["tools"] = tools
 
+        app_logger.info(f"ExpertDispatcher [ollama]: {len(formatted_messages)} msgs, roles={[m.get('role') for m in formatted_messages]}, tools={len(tools) if tools else 0}")
+        if formatted_messages:
+            first = formatted_messages[0]
+            app_logger.info(f"ExpertDispatcher [ollama]: msg[0] role={first.get('role')} content={str(first.get('content',''))[:150]}")
+
         req = urllib.request.Request(
             endpoint,
             data=json.dumps(data).encode('utf-8'),
@@ -385,16 +392,17 @@ class ExpertDispatcher:
             return self.onnx_runner.generate_command(text, label, model_path)
 
         elif model_format == 'gguf':
-            original_path = self.ai_engine.model_path
-            try:
-                if model_path and os.path.exists(model_path):
-                    self.ai_engine.model_path = model_path
-                    if getattr(self.ai_engine, 'llm', None):
-                        self.ai_engine.llm = None
-                        gc.collect()
-                return self.ai_engine.generate_response(text)
-            finally:
-                self.ai_engine.model_path = original_path
+            with self._gguf_lock:
+                original_path = self.ai_engine.model_path
+                try:
+                    if model_path and os.path.exists(model_path):
+                        self.ai_engine.model_path = model_path
+                        if getattr(self.ai_engine, 'llm', None):
+                            self.ai_engine.llm = None
+                            gc.collect()
+                    return self.ai_engine.generate_response(text)
+                finally:
+                    self.ai_engine.model_path = original_path
 
         elif model_format == 'huggingface':
             raise NotImplementedError("Local 'huggingface' format not implemented yet.")

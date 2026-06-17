@@ -166,6 +166,7 @@ class GenericRouter:
         }
         self.scoring_weights = cfg.get('scoring_weights', default_weights)
         self.softmax_temperature = cfg.get('softmax_temperature', 0.15)
+        self._cache_max_size = cfg.get('cache_size', 256)
 
     def _load_categories(self):
         path = self.categories_file
@@ -176,6 +177,9 @@ class GenericRouter:
         try:
             with open(path, encoding='utf-8') as f:
                 data = json.load(f)
+            
+            from modules.config_manager import deobfuscate_value
+            data = deobfuscate_value(data)
 
             self.max_experts = data.get('max_experts', 15)
             experts_list = data.get('experts', [])
