@@ -293,6 +293,10 @@ class SpecificModelRunner:
         """
         Generates output from input text using the specified ONNX model.
         Returns the generated text (str).
+
+        Thread-safety: session y tokenizer se capturan bajo _cleanup_lock
+        en variables locales para evitar que el TTL cleanup las elimine
+        entre _load_model_into_memory y su uso en inferencia (Bug #4).
         """
         if not ONNX_AVAILABLE:
             raise ImportError("ONNX libraries not available.")
@@ -300,10 +304,10 @@ class SpecificModelRunner:
         # SEC-1 + SEC-8: validate label and resolve safe model directory
         model_dir = self._safe_model_dir(label, model_path)
 
-        # OPT-1: mark stats dirty; actual disk write happens in background
+        # OPT-1: mark stats dirty bajo lock (Bug #14)
         with self._cleanup_lock:
             self.stats[label] = self.stats.get(label, 0) + 1
-        self._stats_dirty = True
+            self._stats_dirty = True
 
         # Apply task prefix if needed
         task_prefix = self.MODEL_TASK_PREFIXES.get(label, "")
@@ -318,10 +322,22 @@ class SpecificModelRunner:
             app_logger.error(f"Error loading model {label}: {e}")
             raise
 
-        # Inference
-        try:
+        # Capturar referencias locales bajo lock para evitar evicción entre
+        # _load_model_into_memory y el uso en inferencia (fix Bug #4)
+        with self._cleanup_lock:
+            if label not in self.sessions:
+                raise RuntimeError(
+                    f"Model '{label}' was evicted from memory before inference. "
+                    "Try again."
+                )
             session   = self.sessions[label]
             tokenizer = self.tokenizers[label]
+            self.last_access[label] = time.time()  # Renovar TTL
+
+        # Inference
+        try:
+            session   = session
+            tokenizer = tokenizer
 
             if isinstance(session, tuple):
                 # Encoder-Decoder (T5)
