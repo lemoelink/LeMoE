@@ -120,7 +120,7 @@ class GenericRouter:
         self.softmax_temperature: float = 0.15
         # LRU cache backed by OrderedDict
         self._predict_cache: OrderedDict[str, tuple] = OrderedDict()
-        self._cache_max_size = 256
+        self._cache_max_size = 128
         self._cache_lock = threading.Lock()
 
         self._load_config()
@@ -166,7 +166,7 @@ class GenericRouter:
         }
         self.scoring_weights = cfg.get('scoring_weights', default_weights)
         self.softmax_temperature = cfg.get('softmax_temperature', 0.15)
-        self._cache_max_size = cfg.get('cache_size', 256)
+        self._cache_max_size = cfg.get('cache_size', 128)
 
     def _load_categories(self):
         path = self.categories_file
@@ -233,6 +233,12 @@ class GenericRouter:
                 return
 
         try:
+            # Optimizaciones globales de memoria (light)
+            if TRANSFORMERS_AVAILABLE:
+                import torch as _torch
+                _torch.set_grad_enabled(False)
+                _torch.set_num_threads(2)
+
             if self.router_type == 'embedding':
                 if not SENTENCE_TRANSFORMERS_AVAILABLE:
                     app_logger.error(
@@ -243,6 +249,16 @@ class GenericRouter:
 
                 app_logger.info(f"Loading Semantic Embedding Router from: {self.model_path}...")
                 self._model = SentenceTransformer(self.model_path)
+                # Limitar longitud de secuencia para reducir picos de RAM
+                self._model.max_seq_length = 128
+                # FP16 en CPU: reduce ~470 MB -> ~235 MB
+                try:
+                    import torch as _torch
+                    if not _torch.cuda.is_available():
+                        self._model = self._model.half()
+                        app_logger.info("GenericRouter: embedding model loaded in FP16 (CPU).")
+                except Exception as _e:
+                    app_logger.warning(f"FP16 conversion skipped: {_e}")
 
                 app_logger.info("Precomputing multi-vector representations per expert...")
                 self._precompute_category_embeddings()

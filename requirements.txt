@@ -1,52 +1,22 @@
-# L3mcore - Light Easy Mix Of Experts
-# Dependencias Python necesarias
+# l3mcore light — Dependencias mínimas
+# Solo lo necesario para el router + modelos locales + Ollama
 
-# Servidor WSGI producción
+# Servidor HTTP
 flask>=3.0.0
 gunicorn>=22.0.0
 
-# Router clasificador (grape-route, safetensors/HuggingFace pipeline)
-transformers>=4.30.0
-torch                 # CPU build: pip install torch --index-url https://download.pytorch.org/whl/cpu
-sentencepiece>=0.1.99
+# Router semántico (embedding mode)
 sentence-transformers>=2.2.2
-rapidfuzz>=3.0
-litellm>=1.0.0
+transformers>=4.30.0
+torch                 # CPU: pip install torch --index-url https://download.pytorch.org/whl/cpu
+sentencepiece>=0.1.99
 
-# Modelos ONNX especializados (malbec, syrah, pinot, chardonnay)
+# Keyword fallback (fuzzy)
+rapidfuzz>=3.0
+
+# Modelos ONNX locales
 onnxruntime>=1.15.0
 numpy>=1.24.0
 
 # Motor GGUF fallback
 llama-cpp-python>=0.2.0
-
-# --- Plugins opcionales ---
-# Instalar solo los plugins que se vayan a usar
-
-# plugin: license_manager (Licencias GPG)
-pgpy>=0.6.0
-# requests>=2.31.0 # (ya incluido abajo)
-
-# plugin: erp_connector (Odoo)
-requests>=2.31.0      # ya necesario en paperless_search, listado aqui por claridad
-
-# plugin: bi_reporter (NL -> SQL)
-# pip install sqlalchemy psycopg2-binary pymysql
-sqlalchemy>=2.0.0
-# psycopg2-binary>=2.9.0   # descomentar para PostgreSQL
-# pymysql>=1.1.0           # descomentar para MySQL
-
-# plugin: pii_masker
-# Sin dependencias adicionales para el modo regex puro.
-# Para activar NER con spaCy (use_spacy: true en config):
-#   pip install spacy
-#   python -m spacy download es_core_news_sm
-
-# plugin: calendar_smart (Google Calendar)
-# pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
-# google-api-python-client>=2.100.0
-# google-auth-oauthlib>=1.1.0
-# google-auth-httplib2>=0.2.0
-
-# tool: web_search
-duckduckgo-search>=6.0.0
